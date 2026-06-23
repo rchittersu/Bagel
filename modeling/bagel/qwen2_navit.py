@@ -32,6 +32,7 @@ from modeling.qwen2.modeling_qwen2 import (
 )
 
 from modeling.qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
+from modeling.tp_utils import ColumnParallelLinear, RowParallelLinear
 from modeling.cache_utils.taylorseer import (
     cal_type, taylor_cache_init, derivative_approximation, taylor_formula,
 )
@@ -305,7 +306,7 @@ class PackedAttention(Qwen2Attention):
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
-        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.hidden_size)
+        packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.attn_inner_dim)
         packed_attn_output = self.o_proj(packed_attn_output)
 
         return packed_attn_output
@@ -368,7 +369,7 @@ class PackedAttention(Qwen2Attention):
             max_seqlen_k=max(key_values_lens).item(),
             causal=is_causal,
         )
-        packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
+        packed_attn_output = packed_attn_output.reshape(-1, self.attn_inner_dim)
         packed_attn_output = self.o_proj(packed_attn_output)
 
         if update_past_key_values:
@@ -392,10 +393,15 @@ class PackedAttentionMoT(Qwen2Attention):
             self.q_norm_moe_gen = nn.Identity()
             self.k_norm_moe_gen = nn.Identity()
 
-        self.q_proj_moe_gen = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        # Mirror the sharding of the base und projections: q/k/v column-parallel,
+        # o row-parallel. self.num_heads / self.num_key_value_heads are already the
+        # per-rank (local) counts set by Qwen2Attention.__init__.
+        global_num_heads = config.num_attention_heads
+        global_num_kv_heads = config.num_key_value_heads
+        self.q_proj_moe_gen = ColumnParallelLinear(self.hidden_size, global_num_heads * self.head_dim, bias=True)
+        self.k_proj_moe_gen = ColumnParallelLinear(self.hidden_size, global_num_kv_heads * self.head_dim, bias=True)
+        self.v_proj_moe_gen = ColumnParallelLinear(self.hidden_size, global_num_kv_heads * self.head_dim, bias=True)
+        self.o_proj_moe_gen = RowParallelLinear(global_num_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -586,7 +592,7 @@ class PackedAttentionMoT(Qwen2Attention):
             max_seqlen_k=max(key_values_lens).item(),
             causal=is_causal,
         )
-        packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
+        packed_attn_output = packed_attn_output.reshape(-1, self.attn_inner_dim)
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
         elif mode == 'gen':

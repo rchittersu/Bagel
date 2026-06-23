@@ -28,6 +28,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from .configuration_qwen2 import Qwen2Config
+from ..tp_utils import ColumnParallelLinear, RowParallelLinear, get_tp_world_size
 
 
 if is_flash_attn_2_available():
@@ -192,9 +193,9 @@ class Qwen2MLP(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_state):
@@ -232,24 +233,38 @@ class Qwen2Attention(nn.Module):
             )
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        # head_dim is derived from the *global* head count; it never changes
+        # under tensor parallelism (we shard whole heads across ranks).
+        self.head_dim = self.hidden_size // config.num_attention_heads
+        if (self.head_dim * config.num_attention_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {config.num_attention_heads})."
+            )
+
+        tp_world_size = get_tp_world_size()
+        if config.num_attention_heads % tp_world_size != 0 or config.num_key_value_heads % tp_world_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({config.num_attention_heads}) and num_key_value_heads "
+                f"({config.num_key_value_heads}) must both be divisible by the TP world size ({tp_world_size})."
+            )
+        # Local (this-rank) head counts. Equal to the global counts when TP is off.
+        self.num_heads = config.num_attention_heads // tp_world_size
+        self.num_key_value_heads = config.num_key_value_heads // tp_world_size
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        # Local width of the attention inner dimension (q/o feature size on this rank).
+        self.attn_inner_dim = self.num_heads * self.head_dim
+
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = config.is_causal
         self.attention_dropout = config.attention_dropout
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        # q/k/v are column-parallel (split on heads); o is row-parallel (all-reduce).
+        self.q_proj = ColumnParallelLinear(self.hidden_size, config.num_attention_heads * self.head_dim, bias=True)
+        self.k_proj = ColumnParallelLinear(self.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
+        self.v_proj = ColumnParallelLinear(self.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
+        self.o_proj = RowParallelLinear(config.num_attention_heads * self.head_dim, self.hidden_size, bias=False)
 
     def forward(
         self,
