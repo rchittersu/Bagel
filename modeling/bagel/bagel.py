@@ -98,6 +98,19 @@ class Bagel(PreTrainedModel):
             nn.init.constant_(self.llm2vae.weight, 0)
             nn.init.constant_(self.llm2vae.bias, 0)
 
+    @property
+    def device(self):
+        """Canonical compute device for inference inputs.
+
+        The token embedding is replicated (not TP-sharded) and is a real parameter
+        on every rank's GPU, so its weight device is the right target for the
+        CPU-built tensors produced by the prepare_* helpers. The original code
+        relied on accelerate's AlignDevicesHook (installed by
+        load_checkpoint_and_dispatch) to move these implicitly; the TP build path
+        does not use accelerate, so the entry points move them explicitly instead.
+        """
+        return self.language_model.model.embed_tokens.weight.device
+
     def forward(
         self,
         sequence_length: int,
@@ -274,6 +287,14 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
+        device = self.device
+        packed_text_ids = packed_text_ids.to(device)
+        packed_text_position_ids = packed_text_position_ids.to(device)
+        text_token_lens = text_token_lens.to(device)
+        packed_text_indexes = packed_text_indexes.to(device)
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+        key_values_lens = key_values_lens.to(device)
+
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
 
         extra_inputs = {}
@@ -374,6 +395,19 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
+        device = self.device
+        packed_text_ids = packed_text_ids.to(device)
+        packed_text_indexes = packed_text_indexes.to(device)
+        packed_vit_tokens = packed_vit_tokens.to(device)
+        packed_vit_token_indexes = packed_vit_token_indexes.to(device)
+        packed_vit_position_ids = packed_vit_position_ids.to(device)
+        vit_token_seqlens = vit_token_seqlens.to(device)
+        packed_position_ids = packed_position_ids.to(device)
+        packed_seqlens = packed_seqlens.to(device)
+        packed_indexes = packed_indexes.to(device)
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+        key_values_lens = key_values_lens.to(device)
+
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -505,6 +539,19 @@ class Bagel(PreTrainedModel):
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
     ):
+        device = self.device
+        padded_images = padded_images.to(device)
+        packed_vae_position_ids = packed_vae_position_ids.to(device)
+        packed_timesteps = packed_timesteps.to(device)
+        packed_vae_token_indexes = packed_vae_token_indexes.to(device)
+        packed_text_ids = packed_text_ids.to(device)
+        packed_text_indexes = packed_text_indexes.to(device)
+        packed_position_ids = packed_position_ids.to(device)
+        packed_seqlens = packed_seqlens.to(device)
+        packed_indexes = packed_indexes.to(device)
+        key_values_lens = key_values_lens.to(device)
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -677,6 +724,29 @@ class Bagel(PreTrainedModel):
         # cache_args
         enable_taylorseer=False,
     ):
+        device = self.device
+        packed_text_ids = packed_text_ids.to(device)
+        packed_text_indexes = packed_text_indexes.to(device)
+        packed_init_noises = packed_init_noises.to(device)
+        packed_vae_position_ids = packed_vae_position_ids.to(device)
+        packed_vae_token_indexes = packed_vae_token_indexes.to(device)
+        packed_seqlens = packed_seqlens.to(device)
+        packed_position_ids = packed_position_ids.to(device)
+        packed_indexes = packed_indexes.to(device)
+        key_values_lens = key_values_lens.to(device)
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+        # Optional CFG branches: only present when the corresponding guidance is enabled.
+        def _to_dev(t):
+            return t.to(device) if isinstance(t, torch.Tensor) else t
+        cfg_text_packed_query_indexes = _to_dev(cfg_text_packed_query_indexes)
+        cfg_text_packed_position_ids = _to_dev(cfg_text_packed_position_ids)
+        cfg_text_key_values_lens = _to_dev(cfg_text_key_values_lens)
+        cfg_text_packed_key_value_indexes = _to_dev(cfg_text_packed_key_value_indexes)
+        cfg_img_packed_query_indexes = _to_dev(cfg_img_packed_query_indexes)
+        cfg_img_packed_position_ids = _to_dev(cfg_img_packed_position_ids)
+        cfg_img_key_values_lens = _to_dev(cfg_img_key_values_lens)
+        cfg_img_packed_key_value_indexes = _to_dev(cfg_img_packed_key_value_indexes)
+
         if enable_taylorseer:
             self.language_model.model.enable_taylorseer = True
             model_pred_cache_dic, model_pred_current = cache_init(self, num_timesteps)
@@ -939,6 +1009,12 @@ class Bagel(PreTrainedModel):
         temperature: float = 1.0,
         end_token_id: int = None,
     ):
+        device = self.device
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+        key_values_lens = key_values_lens.to(device)
+        packed_start_tokens = packed_start_tokens.to(device)
+        packed_query_position_ids = packed_query_position_ids.to(device)
+
         step = 0
         generated_sequence = []
         curr_tokens = packed_start_tokens
