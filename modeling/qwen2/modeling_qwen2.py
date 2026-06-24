@@ -197,9 +197,29 @@ class Qwen2MLP(nn.Module):
         self.up_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        # The fused silu*up->fp8 prologue kernel hardcodes SiLU; only fuse if that matches.
+        self._fp8_silu_ok = config.hidden_act == "silu"
 
     def forward(self, hidden_state):
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+
+        # FP8 fused prologue: fold silu(gate)*up into a single per-token quant that
+        # down_proj consumes directly, so the wide intermediate is never re-read at
+        # bf16. Covers every caller (und / gen / MoT) since all route through here.
+        if self._fp8_silu_ok and getattr(self.down_proj, "fp8_enabled", False):
+            from modeling.quant_utils import can_use_scaled_mm
+            from modeling.fp8_triton import silumul_fp8_quant
+
+            k = gate.shape[-1]
+            m = gate.numel() // k
+            if can_use_scaled_mm(m, k):
+                x_fp8, act_scale = silumul_fp8_quant(gate.reshape(m, k), up.reshape(m, k))
+                return self.down_proj.forward_prequantized(
+                    x_fp8, act_scale, lead_shape=gate.shape[:-1]
+                )
+
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv

@@ -93,6 +93,28 @@ def tp_barrier() -> None:
 # --------------------------------------------------------------------------- #
 # Parallel linear layers
 # --------------------------------------------------------------------------- #
+def _quantize_linear_(linear: nn.Module) -> None:
+    """Convert a parallel linear's float ``weight`` Parameter to FP8 e4m3 buffers
+    (``weight_fp8`` + ``weight_scale``) in place and free the float weight.
+
+    Shared by Column/RowParallelLinear.quantize_(). Must run after the checkpoint
+    is loaded (real values) and before eval. Idempotent.
+    """
+    if getattr(linear, "fp8_enabled", False):
+        return
+    from modeling.quant_utils import quantize_weight_rowwise
+
+    device = linear.weight.device
+    w_fp8, w_scale = quantize_weight_rowwise(linear.weight.data)
+    # Drop the float Parameter (register_parameter(None) is the idiomatic free); the
+    # original tensor is then unreferenced and released.
+    linear.weight = None
+    linear.register_buffer("weight_fp8", w_fp8.to(device))
+    linear.register_buffer("weight_scale", w_scale.to(device))
+    linear._fallback_weight = None
+    linear.fp8_enabled = True
+
+
 class ColumnParallelLinear(nn.Module):
     """Linear with the output dimension sharded across TP ranks.
 
@@ -115,8 +137,40 @@ class ColumnParallelLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.out_features_local, in_features))
         self.bias = nn.Parameter(torch.empty(self.out_features_local)) if bias else None
 
+        # FP8 state (opt-in via quantize_()).
+        self.fp8_enabled = False
+        self._fallback_weight = None  # lazily-built bf16 weight for the small-M fallback
+
+    def quantize_(self) -> None:
+        """Replace the loaded float weight with FP8 e4m3 buffers, freeing the float weight."""
+        _quantize_linear_(self)
+
+    def _fallback(self) -> torch.Tensor:
+        if self._fallback_weight is None:
+            from modeling.quant_utils import dequantize_weight
+            self._fallback_weight = dequantize_weight(self.weight_fp8, self.weight_scale)
+        return self._fallback_weight
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fp8_enabled:
+            from modeling.quant_utils import fp8_w8a8_linear
+            return fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
+                                   fallback_weight=self._fallback())
         return F.linear(x, self.weight, self.bias)
+
+    def forward_prequantized(self, x_fp8: torch.Tensor, act_scale: torch.Tensor,
+                             lead_shape=None) -> torch.Tensor:
+        """FP8 forward consuming an externally fused-quant'd 2-D input.
+
+        Lets several column-parallel projections that share one input (q/k/v, or
+        gate/up) reuse a single fused-prologue quant. Bias is added inline, exactly
+        as the float path. Caller guarantees the ``_scaled_mm`` preconditions.
+        """
+        from modeling.quant_utils import scaled_mm_fp8
+        out = scaled_mm_fp8(x_fp8, act_scale, self.weight_fp8, self.weight_scale, self.bias)
+        if lead_shape is not None:
+            out = out.reshape(*lead_shape, self.out_features_local)
+        return out
 
 
 class RowParallelLinear(nn.Module):
@@ -142,8 +196,45 @@ class RowParallelLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_features, self.in_features_local))
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
 
+        # FP8 state (opt-in via quantize_()).
+        self.fp8_enabled = False
+        self._fallback_weight = None  # lazily-built bf16 weight for the small-M fallback
+
+    def quantize_(self) -> None:
+        """Replace the loaded float weight with FP8 e4m3 buffers, freeing the float weight."""
+        _quantize_linear_(self)
+
+    def _fallback(self) -> torch.Tensor:
+        if self._fallback_weight is None:
+            from modeling.quant_utils import dequantize_weight
+            self._fallback_weight = dequantize_weight(self.weight_fp8, self.weight_scale)
+        return self._fallback_weight
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.linear(x, self.weight)
+        if self.fp8_enabled:
+            from modeling.quant_utils import fp8_w8a8_linear
+            # Bias is added AFTER the all-reduce (each rank holds a partial sum), so
+            # the GEMM itself must not add it.
+            out = fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
+                                  fallback_weight=self._fallback())
+        else:
+            out = F.linear(x, self.weight)
+        out = tp_all_reduce(out)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    def forward_prequantized(self, x_fp8: torch.Tensor, act_scale: torch.Tensor,
+                             lead_shape=None) -> torch.Tensor:
+        """FP8 forward consuming an externally fused-quant'd 2-D input (e.g. the
+        ``silu(gate)*up`` -> fp8 prologue feeding ``down_proj``). Keeps the
+        all-reduce-then-bias ordering of the float path. Caller guarantees the
+        ``_scaled_mm`` preconditions.
+        """
+        from modeling.quant_utils import scaled_mm_fp8
+        out = scaled_mm_fp8(x_fp8, act_scale, self.weight_fp8, self.weight_scale, bias=None)
+        if lead_shape is not None:
+            out = out.reshape(*lead_shape, self.out_features)
         out = tp_all_reduce(out)
         if self.bias is not None:
             out = out + self.bias

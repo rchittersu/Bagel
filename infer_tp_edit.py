@@ -91,6 +91,12 @@ def main():
     parser.add_argument("--cfg_renorm_min", type=float, default=0.0)
     parser.add_argument("--cfg_renorm_type", type=str, default="text_channel")
     parser.add_argument("--timestep_shift", type=float, default=3.0)
+    parser.add_argument("--fp8", action="store_true",
+                        help="run the large LLM matmuls in FP8 W8A8 (e4m3) on Hopper")
+    parser.add_argument("--fp8-no-qkv", dest="fp8_include_qkv", action="store_false",
+                        help="keep attention q/k/v projections in bf16 when --fp8 is set")
+    parser.add_argument("--fp8-skip-down", action="store_true",
+                        help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
     args = parser.parse_args()
 
     local_rank = init_tensor_parallel()
@@ -103,7 +109,10 @@ def main():
             print(msg, flush=True)
 
     log(f"[TP-edit] world_size={world_size}, building model on each rank ...")
-    inferencer = load_inferencer(args.model_path, device, torch.bfloat16)
+    inferencer = load_inferencer(
+        args.model_path, device, torch.bfloat16,
+        fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
+    )
 
     dataset = build_dataset(args)
     n = len(dataset)

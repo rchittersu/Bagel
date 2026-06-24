@@ -101,15 +101,28 @@ def build_model(model_path, device, dtype):
     return model, vae_model, config
 
 
-def load_inferencer(model_path, device, dtype=torch.bfloat16):
+def load_inferencer(model_path, device, dtype=torch.bfloat16,
+                    fp8=False, fp8_include_qkv=True, fp8_skip_down=False):
     """Build the TP-sharded Bagel model on `device`, load weights, and wrap it in
     an InterleaveInferencer. Reused by both the single-prompt entrypoint and the
     dataset edit driver. `init_tensor_parallel()` must have been called first.
+
+    When `fp8` is set, the large LLM matmuls are converted to FP8 W8A8 (e4m3) after
+    the checkpoint is loaded and before eval (see modeling/quant_utils.py).
     """
     model, vae_model, config = build_model(model_path, device, dtype)
 
     # Slice + load the checkpoint into this rank's local shards.
     load_sharded_checkpoint(model, os.path.join(model_path, "ema.safetensors"))
+
+    # FP8 must run on real (loaded) weights, before eval.
+    if fp8:
+        from modeling.quant_utils import quantize_model_fp8
+        n = quantize_model_fp8(model, include_qkv=fp8_include_qkv, skip_down=fp8_skip_down)
+        if get_tp_rank() == 0:
+            print(f"[fp8] quantized {n} LLM linears to e4m3 "
+                  f"(include_qkv={fp8_include_qkv}, skip_down={fp8_skip_down})", flush=True)
+
     model = model.eval()
 
     # Keep the VAE in its loaded precision; the inferencer autocasts to bf16 for compute.
@@ -142,6 +155,12 @@ def main():
     parser.add_argument("--cfg_text_scale", type=float, default=4.0)
     parser.add_argument("--image_size", type=int, default=1024)
     parser.add_argument("--benchmark", action="store_true", help="time the generation and report on rank 0")
+    parser.add_argument("--fp8", action="store_true",
+                        help="run the large LLM matmuls in FP8 W8A8 (e4m3) on Hopper")
+    parser.add_argument("--fp8-no-qkv", dest="fp8_include_qkv", action="store_false",
+                        help="keep attention q/k/v projections in bf16 when --fp8 is set")
+    parser.add_argument("--fp8-skip-down", action="store_true",
+                        help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
     args = parser.parse_args()
 
     local_rank = init_tensor_parallel()
@@ -156,7 +175,10 @@ def main():
 
     log(f"[TP] world_size={world_size}, building model on each rank ...")
 
-    inferencer = load_inferencer(args.model_path, device, dtype)
+    inferencer = load_inferencer(
+        args.model_path, device, dtype,
+        fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
+    )
 
     # Identical seed on every rank -> identical replicated noise / sampling.
     set_seed(args.seed)
