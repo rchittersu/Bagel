@@ -496,7 +496,11 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
-        packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
+        # Output buffer is hidden-size wide: o_proj / o_proj_moe_gen map the local
+        # (sharded) attn width up to the full hidden_size under tensor parallelism.
+        packed_attn_output_ = packed_attn_output.new_zeros(
+            (packed_attn_output.shape[0], self.hidden_size)
+        )
         packed_attn_output_[packed_und_token_indexes] = self.o_proj(packed_attn_output[packed_und_token_indexes])
         packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
 
@@ -596,8 +600,17 @@ class PackedAttentionMoT(Qwen2Attention):
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
         elif mode == 'gen':
-            packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            # o_proj / o_proj_moe_gen are row-parallel: their input is the local
+            # (sharded) attn width but their output is the full hidden_size. Write
+            # the projected text / vae rows into a fresh hidden-size buffer rather
+            # than in place, which would assume input width == output width (only
+            # true for the unsharded model).
+            packed_attn_output_ = packed_attn_output.new_zeros(
+                (packed_attn_output.shape[0], self.hidden_size)
+            )
+            packed_attn_output_[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+            packed_attn_output_[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            packed_attn_output = packed_attn_output_
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
