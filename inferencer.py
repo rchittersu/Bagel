@@ -253,6 +253,7 @@ class InterleaveInferencer:
         cfg_renorm_type="global",
         image_shapes=(1024, 1024),
         enable_taylorseer=False,
+        use_vit=True,
     ) -> List[Union[str, Image.Image]]:
 
         output_list = []
@@ -277,7 +278,11 @@ class InterleaveInferencer:
 
                 elif isinstance(input_term, Image.Image):
                     input_term = self.vae_transform.resize_transform(pil_img2rgb(input_term))
-                    gen_context = self.update_context_image(input_term, gen_context, vae=not understanding_output)
+                    # VAE latent is required to edit; the ViT (semantic) encode is optional
+                    # conditioning -- use_vit=False skips it to cut prefill latency.
+                    gen_context = self.update_context_image(
+                        input_term, gen_context, vae=not understanding_output, vit=use_vit
+                    )
 
                     image_shapes = input_term.size[::-1]
                     cfg_text_context = deepcopy(gen_context)

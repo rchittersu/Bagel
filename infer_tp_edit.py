@@ -98,6 +98,7 @@ def run_single_image(inferencer, args, rank, log):
             cfg_renorm_type=args.cfg_renorm_type,
             timestep_shift=args.timestep_shift,
             understanding_output=False,
+            use_vit=not args.no_vit,
         )
 
     # Warmups (timing off): absorb Triton JIT / cuBLAS+_scaled_mm selection / allocator growth.
@@ -143,6 +144,9 @@ def main():
                         help="untimed warmup edits before the measured one (single-image mode)")
     parser.add_argument("--time-prefill", action="store_true",
                         help="print per-phase prefill timing (vae/vit/text) on the measured run")
+    parser.add_argument("--no-vit", action="store_true",
+                        help="skip the ViT (semantic) encode of the input image -- cuts prefill "
+                             "latency; VAE latent still drives the edit (A/B for quality)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--limit", type=int, default=-1, help="only process the first N items (debug)")
     parser.add_argument("--resume", action="store_true", help="skip items whose output already exists")
@@ -226,6 +230,7 @@ def main():
             cfg_renorm_type=args.cfg_renorm_type,
             timestep_shift=args.timestep_shift,
             understanding_output=False,
+            use_vit=not args.no_vit,
         )
 
         if rank == 0:
