@@ -148,7 +148,11 @@ def fp8_w8a8_linear(
         w = fallback_weight if fallback_weight is not None else dequantize_weight(w_fp8, w_scale)
         return F.linear(x, w.to(x.dtype), bias)
 
-    x_fp8, act_scale = quantize_fp8_rowwise(x.reshape(-1, in_features))
+    # Use the fused Triton per-token quant (falls back to the PyTorch reference
+    # when Triton is unavailable). The naive reference quant is multi-pass and, run
+    # per projection per layer, eats the GEMM savings -- so route it through the kernel.
+    from modeling.fp8_triton import quant_fp8_only
+    x_fp8, act_scale = quant_fp8_only(x.reshape(-1, in_features))
     out = scaled_mm_fp8(x_fp8, act_scale, w_fp8, w_scale, bias)
     return out.reshape(*lead_shape, out_features)
 
