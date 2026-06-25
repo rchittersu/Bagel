@@ -40,6 +40,11 @@ FP8_MIN_TOKENS = 32
 # ``_scaled_mm`` requires the contraction dim K to be a multiple of 16.
 FP8_K_MULTIPLE = 16
 
+# Use FP8 accumulation in the MMA (the fast Hopper path) instead of fp32 accumulate.
+# This is the main GEMM-speed lever for _scaled_mm; off by default in torch, which
+# leaves FP8 roughly tied with bf16 cuBLAS. Slight precision cost, fine for inference.
+FP8_FAST_ACCUM = True
+
 _EPS = 1e-12
 
 
@@ -119,6 +124,7 @@ def scaled_mm_fp8(
         scale_a=act_scale.reshape(-1, 1).to(torch.float32),
         scale_b=w_scale.reshape(1, -1).to(torch.float32),
         out_dtype=torch.bfloat16,
+        use_fast_accum=FP8_FAST_ACCUM,
     )
     if bias is not None:
         out = out + bias.to(out.dtype)

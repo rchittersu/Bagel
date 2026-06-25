@@ -17,8 +17,9 @@ import argparse
 import torch
 
 from modeling.quant_utils import (
-    quantize_weight_rowwise, quantize_fp8_rowwise, scaled_mm_fp8, can_use_scaled_mm,
+    quantize_weight_rowwise, scaled_mm_fp8, can_use_scaled_mm, FP8_FAST_ACCUM,
 )
+from modeling.fp8_triton import quant_fp8_only
 
 # (name, in_features, out_features) at world_size 1. Column-parallel layers shard
 # out_features; row-parallel (o_proj, down_proj) shard in_features.
@@ -68,8 +69,9 @@ def bench_layer(name, in_f, out_f, kind, world_size, tokens, device):
         return
 
     w_fp8, w_scale = quantize_weight_rowwise(w)
-    quant = _time(lambda: quantize_fp8_rowwise(x))
-    full = _time(lambda: scaled_mm_fp8(*quantize_fp8_rowwise(x), w_fp8, w_scale))
+    # Use the shipped Triton per-token quant (what the model runs), not the reference.
+    quant = _time(lambda: quant_fp8_only(x))
+    full = _time(lambda: scaled_mm_fp8(*quant_fp8_only(x), w_fp8, w_scale))
     gemm_only = _time(lambda: scaled_mm_fp8(
         x.to(torch.float8_e4m3fn), torch.ones(tokens, 1, device=device), w_fp8, w_scale))
 
@@ -89,7 +91,7 @@ def main():
     device = torch.device("cuda")
     cap = torch.cuda.get_device_capability()
     print(f"device={torch.cuda.get_device_name()} sm={cap[0]}{cap[1]} torch={torch.__version__}")
-    print(f"M(tokens)={args.tokens} world_size={args.world_size}\n")
+    print(f"M(tokens)={args.tokens} world_size={args.world_size} fast_accum={FP8_FAST_ACCUM}\n")
 
     for name, in_f, out_f, kind in LAYERS:
         bench_layer(name, in_f, out_f, kind, args.world_size, args.tokens, device)
