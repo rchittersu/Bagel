@@ -28,6 +28,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from modeling import fp8_profile
+
 
 # --------------------------------------------------------------------------- #
 # Process-group state
@@ -152,11 +154,19 @@ class ColumnParallelLinear(nn.Module):
         return self._fallback_weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.fp8_enabled:
-            from modeling.quant_utils import fp8_w8a8_linear
+        if not self.fp8_enabled:
+            return F.linear(x, self.weight, self.bias)
+        from modeling.quant_utils import fp8_w8a8_linear
+        if not fp8_profile.is_enabled():
             return fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
                                    fallback_weight=self._fallback())
-        return F.linear(x, self.weight, self.bias)
+        m = x.numel() // self.in_features
+        return fp8_profile.run(
+            getattr(self, "_fp8_name", "col_proj"), m,
+            lambda: fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
+                                    fallback_weight=self._fallback()),
+            lambda: F.linear(x, self._fallback(), self.bias),
+        )
 
     def forward_prequantized(self, x_fp8: torch.Tensor, act_scale: torch.Tensor,
                              lead_shape=None) -> torch.Tensor:
@@ -214,9 +224,19 @@ class RowParallelLinear(nn.Module):
         if self.fp8_enabled:
             from modeling.quant_utils import fp8_w8a8_linear
             # Bias is added AFTER the all-reduce (each rank holds a partial sum), so
-            # the GEMM itself must not add it.
-            out = fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
-                                  fallback_weight=self._fallback())
+            # the GEMM itself must not add it. Time the GEMM only; the all-reduce is
+            # identical for fp8 and bf16 and would just cancel in the comparison.
+            if not fp8_profile.is_enabled():
+                out = fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
+                                      fallback_weight=self._fallback())
+            else:
+                m = x.numel() // self.in_features_local
+                out = fp8_profile.run(
+                    getattr(self, "_fp8_name", "row_proj"), m,
+                    lambda: fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
+                                            fallback_weight=self._fallback()),
+                    lambda: F.linear(x, self._fallback()),
+                )
         else:
             out = F.linear(x, self.weight)
         out = tp_all_reduce(out)
@@ -232,7 +252,16 @@ class RowParallelLinear(nn.Module):
         ``_scaled_mm`` preconditions.
         """
         from modeling.quant_utils import scaled_mm_fp8
-        out = scaled_mm_fp8(x_fp8, act_scale, self.weight_fp8, self.weight_scale, bias=None)
+        if not fp8_profile.is_enabled():
+            out = scaled_mm_fp8(x_fp8, act_scale, self.weight_fp8, self.weight_scale, bias=None)
+        else:
+            m = act_scale.numel()  # act_scale is [M, 1]
+            out = fp8_profile.run(
+                getattr(self, "_fp8_name", "row_proj"), m,
+                lambda: scaled_mm_fp8(x_fp8, act_scale, self.weight_fp8, self.weight_scale, bias=None),
+                # Representative bf16 GEMM on the same shapes (values irrelevant for timing).
+                lambda: F.linear(x_fp8.to(torch.bfloat16), self._fallback()),
+            )
         if lead_shape is not None:
             out = out.reshape(*lead_shape, self.out_features)
         out = tp_all_reduce(out)

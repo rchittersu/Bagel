@@ -214,6 +214,7 @@ def quantize_model_fp8(
         if min_numel and module.weight.numel() < min_numel:
             continue
 
+        module._fp8_name = name  # label for the in-run profiler (fp8_profile)
         module.quantize_()
         count += 1
         if verbose:

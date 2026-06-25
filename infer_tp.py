@@ -162,6 +162,8 @@ def main():
                              "measured a net loss at TP>=4, so off by default)")
     parser.add_argument("--fp8-skip-down", action="store_true",
                         help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
+    parser.add_argument("--fp8-profile", action="store_true",
+                        help="time each FP8 linear (A/B vs bf16) in-run, grouped by token count")
     args = parser.parse_args()
 
     local_rank = init_tensor_parallel()
@@ -180,6 +182,11 @@ def main():
         args.model_path, device, dtype,
         fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
     )
+
+    if args.fp8_profile:
+        from modeling import fp8_profile
+        fp8_profile.enable(ab=True)
+        log("[TP] fp8 profiling enabled (A/B vs bf16) -- doubles linear compute for the run")
 
     # Identical seed on every rank -> identical replicated noise / sampling.
     set_seed(args.seed)
@@ -206,6 +213,10 @@ def main():
         if rank == 0:
             print(f"[TP] generation took {time.time() - t0:.2f}s "
                   f"({args.num_timesteps} steps, world_size={world_size})", flush=True)
+
+    if args.fp8_profile and rank == 0:
+        from modeling import fp8_profile
+        fp8_profile.report()
 
     if rank == 0:
         image = output["image"]
