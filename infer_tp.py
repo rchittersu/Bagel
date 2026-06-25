@@ -102,7 +102,7 @@ def build_model(model_path, device, dtype):
 
 
 def load_inferencer(model_path, device, dtype=torch.bfloat16,
-                    fp8=False, fp8_include_qkv=True, fp8_skip_down=False):
+                    fp8=False, fp8_include_qkv=False, fp8_skip_down=False):
     """Build the TP-sharded Bagel model on `device`, load weights, and wrap it in
     an InterleaveInferencer. Reused by both the single-prompt entrypoint and the
     dataset edit driver. `init_tensor_parallel()` must have been called first.
@@ -157,8 +157,9 @@ def main():
     parser.add_argument("--benchmark", action="store_true", help="time the generation and report on rank 0")
     parser.add_argument("--fp8", action="store_true",
                         help="run the large LLM matmuls in FP8 W8A8 (e4m3) on Hopper")
-    parser.add_argument("--fp8-no-qkv", dest="fp8_include_qkv", action="store_false",
-                        help="keep attention q/k/v projections in bf16 when --fp8 is set")
+    parser.add_argument("--fp8-include-qkv", dest="fp8_include_qkv", action="store_true",
+                        help="also quantize attention q/k/v (only helps at low TP; "
+                             "measured a net loss at TP>=4, so off by default)")
     parser.add_argument("--fp8-skip-down", action="store_true",
                         help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
     args = parser.parse_args()

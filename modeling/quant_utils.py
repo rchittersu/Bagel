@@ -174,16 +174,19 @@ _DOWN_PREFIX = "down_proj"
 
 def quantize_model_fp8(
     model: torch.nn.Module,
-    include_qkv: bool = True,
+    include_qkv: bool = False,
     skip_down: bool = False,
     min_numel: int = 0,
     verbose: bool = False,
 ) -> int:
     """Convert selected TP linears in the LLM decoder stack to FP8 in place.
 
-    Target = the large matmuls: MLP ``gate/up/down_proj`` and attention
-    ``o_proj`` / ``q,k,v_proj`` (plus every ``_moe_gen`` twin), for both the und
-    and gen experts. ``lm_head``, embeddings, ViT, VAE and connectors stay bf16.
+    Target = the matmuls that actually win in FP8: MLP ``gate/up/down_proj`` and
+    attention ``o_proj`` (plus every ``_moe_gen`` twin), for both the und and gen
+    experts. ``q/k/v_proj`` are off by default -- at TP>=4 their shards are too
+    small to be compute-bound and FP8 is a measured net loss there (set
+    ``include_qkv=True`` only at low TP). ``lm_head``, embeddings, ViT, VAE and
+    connectors stay bf16.
 
     Must be called *after* the checkpoint is loaded (real weight values) and
     before ``eval()``. Returns the number of layers quantized.
