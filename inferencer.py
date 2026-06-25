@@ -14,9 +14,15 @@ from data.data_utils import pil_img2rgb
 from modeling.bagel.qwen2_navit import NaiveCache
 
 
-# Opt-in prefill timing: BAGEL_TIME_PREFILL=1 prints per-phase wall time (vae / vit /
-# text encode) so the 0.46s prefill can be broken down. Zero impact when unset.
+# Opt-in prefill timing: prints per-phase wall time (vae / vit / text encode) so the
+# prefill can be broken down. Enabled via BAGEL_TIME_PREFILL=1 or set_prefill_timing()
+# at runtime (so warmup runs can stay quiet). Zero impact when off.
 _TIME_PREFILL = os.environ.get("BAGEL_TIME_PREFILL", "0") == "1"
+
+
+def set_prefill_timing(enabled: bool) -> None:
+    global _TIME_PREFILL
+    _TIME_PREFILL = enabled
 
 
 @contextlib.contextmanager

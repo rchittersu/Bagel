@@ -76,10 +76,73 @@ def normalize_item(item):
     return text, image
 
 
+def run_single_image(inferencer, args, rank, log):
+    """One made-up edit on a single image, with untimed warmups then a measured run.
+
+    Lets us exercise the edit prefill (and the per-phase timers) without a dataset.
+    """
+    from inferencer import set_prefill_timing
+
+    image = pil_img2rgb(Image.open(args.image))
+    log(f"[TP-edit] single image: {args.image!r}  prompt: {args.prompt!r}")
+
+    def edit():
+        return inferencer(
+            image=image,
+            text=args.prompt,
+            think=args.think,
+            num_timesteps=args.num_timesteps,
+            cfg_text_scale=args.cfg_text_scale,
+            cfg_img_scale=args.cfg_img_scale,
+            cfg_renorm_min=args.cfg_renorm_min,
+            cfg_renorm_type=args.cfg_renorm_type,
+            timestep_shift=args.timestep_shift,
+            understanding_output=False,
+        )
+
+    # Warmups (timing off): absorb Triton JIT / cuBLAS+_scaled_mm selection / allocator growth.
+    set_prefill_timing(False)
+    for i in range(args.warmup):
+        log(f"[TP-edit] warmup {i + 1}/{args.warmup} ...")
+        set_seed(args.seed)
+        edit()
+    torch.cuda.synchronize()
+    tp_barrier()
+
+    # Measured run.
+    if args.time_prefill:
+        set_prefill_timing(True)
+    set_seed(args.seed)
+    tp_barrier()
+    torch.cuda.synchronize()
+    t0 = time.time()
+    output = edit()
+    torch.cuda.synchronize()
+    tp_barrier()
+    dt = time.time() - t0
+    set_prefill_timing(False)
+
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        out_path = os.path.join(args.output_dir, "single_edit.png")
+        output["image"].save(out_path)
+        print(f"[TP-edit] total edit took {dt:.2f}s ({args.num_timesteps} steps) -> {out_path}",
+              flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="models/BAGEL-7B-MoT")
     parser.add_argument("--output_dir", type=str, default="edits_out")
+    # Single-image mode (no dataset): one --image + --prompt, with warmups + timing.
+    parser.add_argument("--image", type=str, default=None,
+                        help="run a single edit on this image instead of a dataset")
+    parser.add_argument("--prompt", type=str, default="make the background a snowy mountain at sunset",
+                        help="edit instruction for --image single-image mode")
+    parser.add_argument("--warmup", type=int, default=3,
+                        help="untimed warmup edits before the measured one (single-image mode)")
+    parser.add_argument("--time-prefill", action="store_true",
+                        help="print per-phase prefill timing (vae/vit/text) on the measured run")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--limit", type=int, default=-1, help="only process the first N items (debug)")
     parser.add_argument("--resume", action="store_true", help="skip items whose output already exists")
@@ -118,6 +181,12 @@ def main():
         fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
         fp8_min_tokens=args.fp8_min_tokens,
     )
+
+    # Single-image mode: one made-up edit, warmups + timing, no dataset needed.
+    if args.image is not None:
+        run_single_image(inferencer, args, rank, log)
+        tp_barrier()
+        return
 
     dataset = build_dataset(args)
     n = len(dataset)
