@@ -32,10 +32,12 @@ import torch.nn.functional as F
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
 
-# Below this many tokens the GEMM is not compute-bound, ``_scaled_mm`` gives no
-# speedup, and quantizing the activations only costs accuracy -> fall back to
-# bf16. Notably covers the 1-token text-decode step in ``generate_text``.
-FP8_MIN_TOKENS = 32
+# Below this many tokens the GEMM is not compute-bound, _scaled_mm gives no speedup,
+# and quantizing the activations only costs accuracy -> fall back to bf16. Calibrated
+# from the in-run profiler (modeling/fp8_profile): M=315 measured a net loss, M>=3136
+# a clear win, so the crossover sits between -- 2048 stays safely on the win side.
+# Tunable at runtime via set_fp8_min_tokens() (--fp8-min-tokens).
+FP8_MIN_TOKENS = 2048
 
 # ``_scaled_mm`` requires the contraction dim K to be a multiple of 16.
 FP8_K_MULTIPLE = 16
@@ -50,6 +52,12 @@ _EPS = 1e-12
 
 def _scaled_mm_available() -> bool:
     return hasattr(torch, "_scaled_mm")
+
+
+def set_fp8_min_tokens(n: int) -> None:
+    """Override the token-count gate below which linears fall back to bf16."""
+    global FP8_MIN_TOKENS
+    FP8_MIN_TOKENS = n
 
 
 def can_use_scaled_mm(num_tokens: int, k: int) -> bool:

@@ -98,6 +98,9 @@ def main():
                              "measured a net loss at TP>=4, so off by default)")
     parser.add_argument("--fp8-skip-down", action="store_true",
                         help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
+    parser.add_argument("--fp8-min-tokens", type=int, default=None,
+                        help="token-count gate below which FP8 linears fall back to bf16 "
+                             "(default 2048, calibrated from the in-run profiler)")
     args = parser.parse_args()
 
     local_rank = init_tensor_parallel()
@@ -113,6 +116,7 @@ def main():
     inferencer = load_inferencer(
         args.model_path, device, torch.bfloat16,
         fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
+        fp8_min_tokens=args.fp8_min_tokens,
     )
 
     dataset = build_dataset(args)

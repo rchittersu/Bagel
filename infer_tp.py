@@ -102,7 +102,8 @@ def build_model(model_path, device, dtype):
 
 
 def load_inferencer(model_path, device, dtype=torch.bfloat16,
-                    fp8=False, fp8_include_qkv=False, fp8_skip_down=False):
+                    fp8=False, fp8_include_qkv=False, fp8_skip_down=False,
+                    fp8_min_tokens=None):
     """Build the TP-sharded Bagel model on `device`, load weights, and wrap it in
     an InterleaveInferencer. Reused by both the single-prompt entrypoint and the
     dataset edit driver. `init_tensor_parallel()` must have been called first.
@@ -117,7 +118,9 @@ def load_inferencer(model_path, device, dtype=torch.bfloat16,
 
     # FP8 must run on real (loaded) weights, before eval.
     if fp8:
-        from modeling.quant_utils import quantize_model_fp8
+        from modeling.quant_utils import quantize_model_fp8, set_fp8_min_tokens
+        if fp8_min_tokens is not None:
+            set_fp8_min_tokens(fp8_min_tokens)
         n = quantize_model_fp8(model, include_qkv=fp8_include_qkv, skip_down=fp8_skip_down)
         if get_tp_rank() == 0:
             print(f"[fp8] quantized {n} LLM linears to e4m3 "
@@ -162,6 +165,9 @@ def main():
                              "measured a net loss at TP>=4, so off by default)")
     parser.add_argument("--fp8-skip-down", action="store_true",
                         help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
+    parser.add_argument("--fp8-min-tokens", type=int, default=None,
+                        help="token-count gate below which FP8 linears fall back to bf16 "
+                             "(default 2048, calibrated from the in-run profiler)")
     parser.add_argument("--fp8-profile", action="store_true",
                         help="time each FP8 linear (A/B vs bf16) in-run, grouped by token count")
     parser.add_argument("--warmup", type=int, default=None,
@@ -184,6 +190,7 @@ def main():
     inferencer = load_inferencer(
         args.model_path, device, dtype,
         fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
+        fp8_min_tokens=args.fp8_min_tokens,
     )
 
     # Single generation call shared by warmup and the measured run.
