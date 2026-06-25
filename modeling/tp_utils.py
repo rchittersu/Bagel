@@ -156,17 +156,20 @@ class ColumnParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.fp8_enabled:
             return F.linear(x, self.weight, self.bias)
-        from modeling.quant_utils import fp8_w8a8_linear
-        if not fp8_profile.is_enabled():
-            return fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
-                                   fallback_weight=self._fallback())
-        m = x.numel() // self.in_features
-        return fp8_profile.run(
-            getattr(self, "_fp8_name", "col_proj"), m,
-            lambda: fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
-                                    fallback_weight=self._fallback()),
-            lambda: F.linear(x, self._fallback(), self.bias),
-        )
+        from modeling.quant_utils import fp8_w8a8_linear, can_use_scaled_mm
+        # Only profile when FP8 actually runs (token gate met); below the gate the
+        # call falls back to bf16, which isn't an FP8 datapoint and just clutters the report.
+        if fp8_profile.is_enabled():
+            m = x.numel() // self.in_features
+            if can_use_scaled_mm(m, self.in_features):
+                return fp8_profile.run(
+                    getattr(self, "_fp8_name", "col_proj"), m,
+                    lambda: fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
+                                            fallback_weight=self._fallback()),
+                    lambda: F.linear(x, self._fallback(), self.bias),
+                )
+        return fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, self.bias,
+                               fallback_weight=self._fallback())
 
     def forward_prequantized(self, x_fp8: torch.Tensor, act_scale: torch.Tensor,
                              lead_shape=None) -> torch.Tensor:
@@ -222,21 +225,24 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.fp8_enabled:
-            from modeling.quant_utils import fp8_w8a8_linear
+            from modeling.quant_utils import fp8_w8a8_linear, can_use_scaled_mm
             # Bias is added AFTER the all-reduce (each rank holds a partial sum), so
             # the GEMM itself must not add it. Time the GEMM only; the all-reduce is
             # identical for fp8 and bf16 and would just cancel in the comparison.
-            if not fp8_profile.is_enabled():
+            # Only profile when FP8 actually runs (token gate met).
+            out = None
+            if fp8_profile.is_enabled():
+                m = x.numel() // self.in_features_local
+                if can_use_scaled_mm(m, self.in_features_local):
+                    out = fp8_profile.run(
+                        getattr(self, "_fp8_name", "row_proj"), m,
+                        lambda: fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
+                                                fallback_weight=self._fallback()),
+                        lambda: F.linear(x, self._fallback()),
+                    )
+            if out is None:
                 out = fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
                                       fallback_weight=self._fallback())
-            else:
-                m = x.numel() // self.in_features_local
-                out = fp8_profile.run(
-                    getattr(self, "_fp8_name", "row_proj"), m,
-                    lambda: fp8_w8a8_linear(x, self.weight_fp8, self.weight_scale, bias=None,
-                                            fallback_weight=self._fallback()),
-                    lambda: F.linear(x, self._fallback()),
-                )
         else:
             out = F.linear(x, self.weight)
         out = tp_all_reduce(out)
