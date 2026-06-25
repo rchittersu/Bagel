@@ -164,6 +164,9 @@ def main():
                         help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
     parser.add_argument("--fp8-profile", action="store_true",
                         help="time each FP8 linear (A/B vs bf16) in-run, grouped by token count")
+    parser.add_argument("--warmup", type=int, default=None,
+                        help="untimed warmup generations before measuring "
+                             "(default 3 when --benchmark/--fp8-profile, else 0)")
     args = parser.parse_args()
 
     local_rank = init_tensor_parallel()
@@ -183,6 +186,30 @@ def main():
         fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
     )
 
+    # Single generation call shared by warmup and the measured run.
+    def generate():
+        return inferencer(
+            text=args.prompt,
+            think=False,
+            image_shapes=(args.image_size, args.image_size),
+            num_timesteps=args.num_timesteps,
+            cfg_text_scale=args.cfg_text_scale,
+            understanding_output=False,
+        )
+
+    # Warm up before any measurement: the first calls pay Triton JIT, cuBLAS /
+    # _scaled_mm algorithm selection and allocator growth, which would otherwise
+    # pollute the timed/profiled run.
+    n_warmup = args.warmup if args.warmup is not None else (3 if (args.benchmark or args.fp8_profile) else 0)
+    for i in range(n_warmup):
+        log(f"[TP] warmup {i + 1}/{n_warmup} ...")
+        set_seed(args.seed)
+        generate()
+    if n_warmup:
+        torch.cuda.synchronize()
+        tp_barrier()
+
+    # Enable profiling only AFTER warmup, so JIT/setup time isn't recorded.
     if args.fp8_profile:
         from modeling import fp8_profile
         fp8_profile.enable(ab=True)
@@ -198,14 +225,7 @@ def main():
         tp_barrier()
         t0 = time.time()
 
-    output = inferencer(
-        text=args.prompt,
-        think=False,
-        image_shapes=(args.image_size, args.image_size),
-        num_timesteps=args.num_timesteps,
-        cfg_text_scale=args.cfg_text_scale,
-        understanding_output=False,
-    )
+    output = generate()
 
     if args.benchmark:
         torch.cuda.synchronize()
