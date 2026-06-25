@@ -1,6 +1,9 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+import os
+import time
 from copy import deepcopy
 from typing import List, Dict, Optional, Union, Any
 
@@ -9,6 +12,25 @@ import torch
 
 from data.data_utils import pil_img2rgb
 from modeling.bagel.qwen2_navit import NaiveCache
+
+
+# Opt-in prefill timing: BAGEL_TIME_PREFILL=1 prints per-phase wall time (vae / vit /
+# text encode) so the 0.46s prefill can be broken down. Zero impact when unset.
+_TIME_PREFILL = os.environ.get("BAGEL_TIME_PREFILL", "0") == "1"
+
+
+@contextlib.contextmanager
+def _phase(label):
+    if not _TIME_PREFILL:
+        yield
+        return
+    torch.cuda.synchronize()
+    t0 = time.time()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        print(f"[prefill] {label}: {(time.time() - t0) * 1000:.1f}ms", flush=True)
 
 
 
@@ -43,15 +65,15 @@ class InterleaveInferencer:
         past_key_values = gen_context['past_key_values']
         kv_lens = gen_context['kv_lens']
         ropes = gen_context['ropes']
-        generation_input, kv_lens, ropes = self.model.prepare_prompts(
-            curr_kvlens=kv_lens,
-            curr_rope=ropes, 
-            prompts=[text],
-            tokenizer=self.tokenizer, 
-            new_token_ids=self.new_token_ids,
-        )
-
-        past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)        
+        with _phase("text encode"):
+            generation_input, kv_lens, ropes = self.model.prepare_prompts(
+                curr_kvlens=kv_lens,
+                curr_rope=ropes,
+                prompts=[text],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
+            )
+            past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
         gen_context['past_key_values'] = past_key_values
@@ -69,25 +91,27 @@ class InterleaveInferencer:
 
         if vae:
             ## update vae
-            generation_input, kv_lens, ropes = self.model.prepare_vae_images(
-                curr_kvlens=kv_lens,
-                curr_rope=ropes, 
-                images=[image],
-                transforms=self.vae_transform, 
-                new_token_ids=self.new_token_ids,
-            )
-            past_key_values = self.model.forward_cache_update_vae(self.vae_model, past_key_values, **generation_input)
-        
+            with _phase("vae encode"):
+                generation_input, kv_lens, ropes = self.model.prepare_vae_images(
+                    curr_kvlens=kv_lens,
+                    curr_rope=ropes,
+                    images=[image],
+                    transforms=self.vae_transform,
+                    new_token_ids=self.new_token_ids,
+                )
+                past_key_values = self.model.forward_cache_update_vae(self.vae_model, past_key_values, **generation_input)
+
         if vit:
             ## update vit
-            generation_input, kv_lens, ropes = self.model.prepare_vit_images(
-                curr_kvlens=kv_lens,
-                curr_rope=ropes, 
-                images=[image],
-                transforms=self.vit_transform, 
-                new_token_ids=self.new_token_ids,
-            )
-            past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
+            with _phase("vit encode"):
+                generation_input, kv_lens, ropes = self.model.prepare_vit_images(
+                    curr_kvlens=kv_lens,
+                    curr_rope=ropes,
+                    images=[image],
+                    transforms=self.vit_transform,
+                    new_token_ids=self.new_token_ids,
+                )
+                past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
 
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
