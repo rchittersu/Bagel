@@ -158,15 +158,17 @@ def main():
     parser.add_argument("--cfg_renorm_min", type=float, default=0.0)
     parser.add_argument("--cfg_renorm_type", type=str, default="text_channel")
     parser.add_argument("--timestep_shift", type=float, default=3.0)
-    parser.add_argument("--fp8", action="store_true",
-                        help="run the large LLM matmuls in FP8 W8A8 (e4m3) on Hopper")
-    parser.add_argument("--fp8-include-qkv", dest="fp8_include_qkv", action="store_true",
+    parser.add_argument("--quant", choices=["fp8", "int8"], default=None,
+                        help="W8A8 scheme for the large LLM matmuls (fp8=_scaled_mm, int8=_int_mm)")
+    parser.add_argument("--fp8", action="store_true", help="shorthand for --quant fp8")
+    parser.add_argument("--int8", action="store_true", help="shorthand for --quant int8")
+    parser.add_argument("--quant-include-qkv", dest="quant_include_qkv", action="store_true",
                         help="also quantize attention q/k/v (only helps at low TP; "
                              "measured a net loss at TP>=4, so off by default)")
-    parser.add_argument("--fp8-skip-down", action="store_true",
-                        help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
-    parser.add_argument("--fp8-min-tokens", type=int, default=None,
-                        help="token-count gate below which FP8 linears fall back to bf16 "
+    parser.add_argument("--quant-skip-down", dest="quant_skip_down", action="store_true",
+                        help="keep the outlier-prone MLP down_proj in bf16 when quantizing")
+    parser.add_argument("--quant-min-tokens", dest="quant_min_tokens", type=int, default=None,
+                        help="token-count gate below which quantized linears fall back to bf16 "
                              "(default 2048, calibrated from the in-run profiler)")
     args = parser.parse_args()
 
@@ -180,10 +182,11 @@ def main():
             print(msg, flush=True)
 
     log(f"[TP-edit] world_size={world_size}, building model on each rank ...")
+    quant = args.quant or ("fp8" if args.fp8 else "int8" if args.int8 else None)
     inferencer = load_inferencer(
         args.model_path, device, torch.bfloat16,
-        fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
-        fp8_min_tokens=args.fp8_min_tokens,
+        quant=quant, include_qkv=args.quant_include_qkv, skip_down=args.quant_skip_down,
+        min_tokens=args.quant_min_tokens,
     )
 
     # Single-image mode: one made-up edit, warmups + timing, no dataset needed.

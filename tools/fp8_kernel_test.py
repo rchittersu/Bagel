@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from modeling.quant_utils import (
-    FP8_MAX, quantize_weight_rowwise, quantize_fp8_rowwise, fp8_w8a8_linear,
+    FP8_MAX, quantize_weight_rowwise, quantize_fp8_rowwise, quant_w8a8_linear,
 )
 import modeling.fp8_triton as fp8t
 
@@ -69,15 +69,32 @@ def main():
     ok &= check_kernel("quant_fp8_only", fp8t.quant_fp8_only_triton,
                        fp8t.quant_fp8_only_ref, x)
 
-    # 2. FP8 linear vs bf16 F.linear.
+    # 1b. INT8 Triton kernels vs reference.
+    ok &= check_kernel("quant_int8_only", fp8t.quant_int8_only_triton,
+                       fp8t.quant_int8_only_ref, x)
+    ok &= check_kernel("silumul_int8_quant", fp8t.silumul_int8_quant_triton,
+                       fp8t.silumul_int8_quant_ref, gate, up)
+    if fp8t._HAS_TRITON:
+        acc = torch.randint(-(1 << 20), 1 << 20, (M, H), device=device, dtype=torch.int32)
+        a_s = torch.rand(M, 1, device=device) * 1e-3
+        w_s = torch.rand(1, H, device=device) * 1e-3
+        d_t = fp8t.dequant_int32_triton(acc, a_s, w_s)
+        d_r = fp8t.dequant_int32_ref(acc, a_s, w_s)
+        deq_ok = torch.allclose(d_t.float(), d_r.float(), rtol=1e-3, atol=1e-4)
+        ok &= deq_ok
+        print(f"[{'ok' if deq_ok else 'FAIL'}] dequant_int32 vs ref: "
+              f"max_abs={(d_t.float() - d_r.float()).abs().amax().item():.2e}")
+
+    # 2. FP8 / INT8 linear vs bf16 F.linear.
     w = torch.randn(H, H, device=device, dtype=torch.bfloat16) * (H ** -0.5)
-    w_fp8, w_scale = quantize_weight_rowwise(w)
     y_ref = F.linear(x, w)
-    y_fp8 = fp8_w8a8_linear(x, w_fp8, w_scale)
-    cos = _cos(y_ref, y_fp8)
-    lin_ok = cos > 0.99
-    ok &= lin_ok
-    print(f"[{'ok' if lin_ok else 'FAIL'}] fp8_w8a8_linear vs F.linear: cos={cos:.5f}")
+    for scheme in ("fp8", "int8"):
+        w_q, w_scale = quantize_weight_rowwise(w, scheme)
+        y_q = quant_w8a8_linear(x, w_q, w_scale, scheme)
+        cos = _cos(y_ref, y_q)
+        lin_ok = cos > 0.99
+        ok &= lin_ok
+        print(f"[{'ok' if lin_ok else 'FAIL'}] {scheme}_w8a8_linear vs F.linear: cos={cos:.5f}")
 
     # 3. Fused vs naive prologue speed (informational).
     if fp8t._HAS_TRITON:

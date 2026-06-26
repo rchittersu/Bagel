@@ -102,29 +102,29 @@ def build_model(model_path, device, dtype):
 
 
 def load_inferencer(model_path, device, dtype=torch.bfloat16,
-                    fp8=False, fp8_include_qkv=False, fp8_skip_down=False,
-                    fp8_min_tokens=None):
+                    quant=None, include_qkv=False, skip_down=False,
+                    min_tokens=None):
     """Build the TP-sharded Bagel model on `device`, load weights, and wrap it in
     an InterleaveInferencer. Reused by both the single-prompt entrypoint and the
     dataset edit driver. `init_tensor_parallel()` must have been called first.
 
-    When `fp8` is set, the large LLM matmuls are converted to FP8 W8A8 (e4m3) after
-    the checkpoint is loaded and before eval (see modeling/quant_utils.py).
+    When `quant` is "fp8" or "int8", the large LLM matmuls are converted to that W8A8
+    scheme after the checkpoint is loaded and before eval (see modeling/quant_utils.py).
     """
     model, vae_model, config = build_model(model_path, device, dtype)
 
     # Slice + load the checkpoint into this rank's local shards.
     load_sharded_checkpoint(model, os.path.join(model_path, "ema.safetensors"))
 
-    # FP8 must run on real (loaded) weights, before eval.
-    if fp8:
-        from modeling.quant_utils import quantize_model_fp8, set_fp8_min_tokens
-        if fp8_min_tokens is not None:
-            set_fp8_min_tokens(fp8_min_tokens)
-        n = quantize_model_fp8(model, include_qkv=fp8_include_qkv, skip_down=fp8_skip_down)
+    # Quantization must run on real (loaded) weights, before eval.
+    if quant:
+        from modeling.quant_utils import quantize_model, set_quant_min_tokens
+        if min_tokens is not None:
+            set_quant_min_tokens(min_tokens)
+        n = quantize_model(model, scheme=quant, include_qkv=include_qkv, skip_down=skip_down)
         if get_tp_rank() == 0:
-            print(f"[fp8] quantized {n} LLM linears to e4m3 "
-                  f"(include_qkv={fp8_include_qkv}, skip_down={fp8_skip_down})", flush=True)
+            print(f"[{quant}] quantized {n} LLM linears "
+                  f"(include_qkv={include_qkv}, skip_down={skip_down})", flush=True)
 
     model = model.eval()
 
@@ -158,21 +158,23 @@ def main():
     parser.add_argument("--cfg_text_scale", type=float, default=4.0)
     parser.add_argument("--image_size", type=int, default=1024)
     parser.add_argument("--benchmark", action="store_true", help="time the generation and report on rank 0")
-    parser.add_argument("--fp8", action="store_true",
-                        help="run the large LLM matmuls in FP8 W8A8 (e4m3) on Hopper")
-    parser.add_argument("--fp8-include-qkv", dest="fp8_include_qkv", action="store_true",
+    parser.add_argument("--quant", choices=["fp8", "int8"], default=None,
+                        help="W8A8 scheme for the large LLM matmuls (fp8=_scaled_mm, int8=_int_mm)")
+    parser.add_argument("--fp8", action="store_true", help="shorthand for --quant fp8")
+    parser.add_argument("--int8", action="store_true", help="shorthand for --quant int8")
+    parser.add_argument("--quant-include-qkv", dest="quant_include_qkv", action="store_true",
                         help="also quantize attention q/k/v (only helps at low TP; "
                              "measured a net loss at TP>=4, so off by default)")
-    parser.add_argument("--fp8-skip-down", action="store_true",
-                        help="keep the outlier-prone MLP down_proj in bf16 when --fp8 is set")
-    parser.add_argument("--fp8-min-tokens", type=int, default=None,
-                        help="token-count gate below which FP8 linears fall back to bf16 "
+    parser.add_argument("--quant-skip-down", dest="quant_skip_down", action="store_true",
+                        help="keep the outlier-prone MLP down_proj in bf16 when quantizing")
+    parser.add_argument("--quant-min-tokens", dest="quant_min_tokens", type=int, default=None,
+                        help="token-count gate below which quantized linears fall back to bf16 "
                              "(default 2048, calibrated from the in-run profiler)")
-    parser.add_argument("--fp8-profile", action="store_true",
-                        help="time each FP8 linear (A/B vs bf16) in-run, grouped by token count")
+    parser.add_argument("--quant-profile", dest="quant_profile", action="store_true",
+                        help="time each quantized linear (A/B vs bf16) in-run, grouped by token count")
     parser.add_argument("--warmup", type=int, default=None,
                         help="untimed warmup generations before measuring "
-                             "(default 3 when --benchmark/--fp8-profile, else 0)")
+                             "(default 3 when --benchmark/--quant-profile, else 0)")
     args = parser.parse_args()
 
     local_rank = init_tensor_parallel()
@@ -187,10 +189,11 @@ def main():
 
     log(f"[TP] world_size={world_size}, building model on each rank ...")
 
+    quant = args.quant or ("fp8" if args.fp8 else "int8" if args.int8 else None)
     inferencer = load_inferencer(
         args.model_path, device, dtype,
-        fp8=args.fp8, fp8_include_qkv=args.fp8_include_qkv, fp8_skip_down=args.fp8_skip_down,
-        fp8_min_tokens=args.fp8_min_tokens,
+        quant=quant, include_qkv=args.quant_include_qkv, skip_down=args.quant_skip_down,
+        min_tokens=args.quant_min_tokens,
     )
 
     # Single generation call shared by warmup and the measured run.
@@ -207,7 +210,7 @@ def main():
     # Warm up before any measurement: the first calls pay Triton JIT, cuBLAS /
     # _scaled_mm algorithm selection and allocator growth, which would otherwise
     # pollute the timed/profiled run.
-    n_warmup = args.warmup if args.warmup is not None else (3 if (args.benchmark or args.fp8_profile) else 0)
+    n_warmup = args.warmup if args.warmup is not None else (3 if (args.benchmark or args.quant_profile) else 0)
     for i in range(n_warmup):
         log(f"[TP] warmup {i + 1}/{n_warmup} ...")
         set_seed(args.seed)
@@ -217,7 +220,7 @@ def main():
         tp_barrier()
 
     # Enable profiling only AFTER warmup, so JIT/setup time isn't recorded.
-    if args.fp8_profile:
+    if args.quant_profile:
         from modeling import fp8_profile
         fp8_profile.enable(ab=True)
         log("[TP] fp8 profiling enabled (A/B vs bf16) -- doubles linear compute for the run")
@@ -241,7 +244,7 @@ def main():
             print(f"[TP] generation took {time.time() - t0:.2f}s "
                   f"({args.num_timesteps} steps, world_size={world_size})", flush=True)
 
-    if args.fp8_profile and rank == 0:
+    if args.quant_profile and rank == 0:
         from modeling import fp8_profile
         fp8_profile.report()
 

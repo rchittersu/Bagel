@@ -204,19 +204,20 @@ class Qwen2MLP(nn.Module):
         gate = self.gate_proj(hidden_state)
         up = self.up_proj(hidden_state)
 
-        # FP8 fused prologue: fold silu(gate)*up into a single per-token quant that
+        # W8A8 fused prologue: fold silu(gate)*up into a single per-token quant that
         # down_proj consumes directly, so the wide intermediate is never re-read at
         # bf16. Covers every caller (und / gen / MoT) since all route through here.
-        if self._fp8_silu_ok and getattr(self.down_proj, "fp8_enabled", False):
-            from modeling.quant_utils import can_use_scaled_mm
-            from modeling.fp8_triton import silumul_fp8_quant
+        scheme = getattr(self.down_proj, "quant_scheme", None)
+        if self._fp8_silu_ok and scheme is not None:
+            from modeling.quant_utils import can_quant
+            from modeling.fp8_triton import silumul_quant
 
             k = gate.shape[-1]
             m = gate.numel() // k
-            if can_use_scaled_mm(m, k):
-                x_fp8, act_scale = silumul_fp8_quant(gate.reshape(m, k), up.reshape(m, k))
+            if can_quant(scheme, m, k):
+                x_q, act_scale = silumul_quant(gate.reshape(m, k), up.reshape(m, k), scheme)
                 return self.down_proj.forward_prequantized(
-                    x_fp8, act_scale, lead_shape=gate.shape[:-1]
+                    x_q, act_scale, lead_shape=gate.shape[:-1]
                 )
 
         return self.down_proj(self.act_fn(gate) * up)

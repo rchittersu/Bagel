@@ -73,44 +73,47 @@ def run(name: str, m: int, fp8_fn, bf16_fn):
 
     Call site only builds the lambdas when is_enabled(), so the off path is free.
     """
-    out = _time(name, m, "fp8", fp8_fn)
+    out = _time(name, m, "quant", fp8_fn)
     if _AB and bf16_fn is not None:
         _time(name, m, "bf16", bf16_fn)
     return out
 
 
 def report(reset_after: bool = True) -> None:
-    """Print per-(tokens, layer) aggregated FP8 vs bf16 time, sorted by token count."""
+    """Print per-(tokens, layer) aggregated quant (fp8|int8) vs bf16 time, sorted by tokens.
+
+    Scheme-agnostic: the 'quant ms' column holds whichever scheme actually ran.
+    """
     if not _events:
-        print("[fp8-profile] no events recorded", flush=True)
+        print("[quant-profile] no events recorded", flush=True)
         return
     torch.cuda.synchronize()  # one sync: all events are now complete
 
-    agg = defaultdict(lambda: {"calls": 0, "fp8": 0.0, "bf16": 0.0})
+    agg = defaultdict(lambda: {"calls": 0, "quant": 0.0, "bf16": 0.0})
     for name, m, kind, s, e in _events:
         a = agg[(m, name)]
         a[kind] += s.elapsed_time(e)
-        if kind == "fp8":
+        if kind == "quant":
             a["calls"] += 1
 
-    print("\n[fp8-profile] per-layer time grouped by tokens (totals over the run):", flush=True)
-    print(f"{'tokens':>8} {'layer':<26} {'calls':>6} {'fp8 ms':>9} {'bf16 ms':>9} {'s':>6}", flush=True)
-    bucket_tot = defaultdict(lambda: {"fp8": 0.0, "bf16": 0.0})
+    print("\n[quant-profile] per-layer time grouped by tokens (totals over the run):", flush=True)
+    print(f"{'tokens':>8} {'layer':<26} {'calls':>6} {'quant ms':>9} {'bf16 ms':>9} {'s':>6}", flush=True)
+    bucket_tot = defaultdict(lambda: {"quant": 0.0, "bf16": 0.0})
     for (m, name) in sorted(agg.keys()):
         a = agg[(m, name)]
-        s = (a["bf16"] / a["fp8"]) if (a["bf16"] and a["fp8"]) else float("nan")
-        print(f"{m:>8} {name:<26} {a['calls']:>6} {a['fp8']:>9.2f} {a['bf16']:>9.2f} {s:>6.2f}",
+        s = (a["bf16"] / a["quant"]) if (a["bf16"] and a["quant"]) else float("nan")
+        print(f"{m:>8} {name:<26} {a['calls']:>6} {a['quant']:>9.2f} {a['bf16']:>9.2f} {s:>6.2f}",
               flush=True)
-        bucket_tot[m]["fp8"] += a["fp8"]
+        bucket_tot[m]["quant"] += a["quant"]
         bucket_tot[m]["bf16"] += a["bf16"]
 
     print("-" * 70, flush=True)
     for m in sorted(bucket_tot.keys()):
         b = bucket_tot[m]
-        s = (b["bf16"] / b["fp8"]) if (b["bf16"] and b["fp8"]) else float("nan")
+        s = (b["bf16"] / b["quant"]) if (b["bf16"] and b["quant"]) else float("nan")
         verdict = "WIN" if s > 1 else "loss"
         print(f"{m:>8} {'TOTAL @ this token count':<26} {'':>6} "
-              f"{b['fp8']:>9.2f} {b['bf16']:>9.2f} {s:>6.2f}  {verdict}", flush=True)
+              f"{b['quant']:>9.2f} {b['bf16']:>9.2f} {s:>6.2f}  {verdict}", flush=True)
 
     if reset_after:
         reset()
