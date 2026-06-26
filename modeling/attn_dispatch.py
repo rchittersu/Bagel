@@ -93,9 +93,10 @@ def attn_varlen_func(
         return _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
 
     # A/B: time both backends on the same inputs; return the active backend's result.
-    m = int(q.shape[0])  # total query tokens
+    # Key by (q_len, kv_len) -- attention is q->context cross-attn, kv_len >> q_len.
+    q_len, kv_len = int(q.shape[0]), int(k.shape[0])
     flash_fn = lambda: _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
     sage_fn = lambda: _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
     if _BACKEND == "sage":
-        return attn_profile.run(m, "sage", sage_fn, "flash", flash_fn)
-    return attn_profile.run(m, "flash", flash_fn, "sage", sage_fn)
+        return attn_profile.run(q_len, kv_len, "sage", sage_fn, "flash", flash_fn)
+    return attn_profile.run(q_len, kv_len, "flash", flash_fn, "sage", sage_fn)
