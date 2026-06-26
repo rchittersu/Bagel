@@ -26,6 +26,10 @@ from modeling import attn_profile
 # Resolved once at import; override at runtime with set_attn_backend().
 _BACKEND = os.environ.get("BAGEL_ATTN_BACKEND", "flash").lower()
 
+# Expand grouped KV heads to match q before sage (only needed if sage lacks native GQA).
+# Off by default: the expand is a 7x copy of the frozen context KV every call.
+_SAGE_EXPAND_GQA = os.environ.get("BAGEL_SAGE_EXPAND_GQA", "0") == "1"
+
 
 def get_attn_backend() -> str:
     """Return the active backend name: "sage" or "flash"."""
@@ -53,11 +57,11 @@ def _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
     # Imported lazily so the default (flash) path has no sageattention dependency.
     from sageattention import sageattn_varlen
 
-    # GQA: FlashAttention does grouped KV natively, but some SageAttention builds
-    # require equal q / kv heads. Expand k/v to match q when they differ. If your
-    # sage build handles GQA natively, drop this block.
+    # GQA: FlashAttention does grouped KV natively. Only expand k/v to match q if the
+    # installed sage build can't (BAGEL_SAGE_EXPAND_GQA=1). The expand is a 7x KV copy
+    # of the (frozen) context every call, so leave it OFF when sage handles GQA.
     hq, hkv = q.shape[-2], k.shape[-2]
-    if hq != hkv:
+    if _SAGE_EXPAND_GQA and hq != hkv:
         rep = hq // hkv
         k = k.repeat_interleave(rep, dim=-2)
         v = v.repeat_interleave(rep, dim=-2)
