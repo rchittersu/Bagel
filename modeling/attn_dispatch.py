@@ -5,6 +5,8 @@ Attention backend dispatch for BAGEL's packed/varlen attention.
 
 Selects the backend from the ``BAGEL_ATTN_BACKEND`` environment variable:
   - ``sage``                 -> SageAttention (quantized)
+  - ``flash3``               -> FlashAttention-3 (Hopper-native; install separately as
+                                ``flash_attn_interface``, the flash-attention hopper/ build)
   - anything else / unset    -> the existing FlashAttention-2 path (default)
 
 All call sites (LLM ``qwen2_navit`` + ViT ``siglip_navit``) go through
@@ -53,6 +55,21 @@ def _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_
     )
 
 
+def _flash3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+    # FlashAttention-3 (Hopper). Installed separately as ``flash_attn_interface`` (the
+    # flash-attention repo's hopper/ build). FP16/BF16 is exact; FP8 is a separate opt-in.
+    from flash_attn_interface import flash_attn_varlen_func as fa3_varlen
+
+    out = fa3_varlen(
+        q, k, v,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        causal=causal,
+    )
+    # FA3 returns (out, softmax_lse) on some versions; take the output tensor.
+    return out[0] if isinstance(out, tuple) else out
+
+
 def _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
     # Imported lazily so the default (flash) path has no sageattention dependency.
     from sageattention import sageattn_varlen
@@ -87,16 +104,24 @@ def attn_varlen_func(
     Dispatches to Sage or FlashAttention per ``BAGEL_ATTN_BACKEND``. q/k/v packed
     ``[total_tokens, n_heads, head_dim]``; GQA allowed.
     """
-    if not attn_profile.is_enabled():
-        if _BACKEND == "sage":
-            return _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
-        return _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+    args = (q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+    backends = {
+        "flash": lambda: _flash_varlen(*args),
+        "flash3": lambda: _flash3_varlen(*args),
+        "sage": lambda: _sage_varlen(*args),
+    }
+    primary_name = _BACKEND if _BACKEND in backends else "flash"
 
-    # A/B: time both backends on the same inputs; return the active backend's result.
+    if not attn_profile.is_enabled():
+        return backends[primary_name]()
+
+    # A/B: time the active backend and a baseline on the same inputs; return the active
+    # result. Baseline = FA2-flash (the reference), or sage when flash is active.
     # Key by (q_len, kv_len) -- attention is q->context cross-attn, kv_len >> q_len.
     q_len, kv_len = int(q.shape[0]), int(k.shape[0])
-    flash_fn = lambda: _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
-    sage_fn = lambda: _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
-    if _BACKEND == "sage":
-        return attn_profile.run(q_len, kv_len, "sage", sage_fn, "flash", flash_fn)
-    return attn_profile.run(q_len, kv_len, "flash", flash_fn, "sage", sage_fn)
+    other_name = "flash" if primary_name != "flash" else "sage"
+    return attn_profile.run(
+        q_len, kv_len,
+        primary_name, backends[primary_name],
+        other_name, backends[other_name],
+    )
