@@ -172,6 +172,8 @@ def main():
                              "(default 2048, calibrated from the in-run profiler)")
     parser.add_argument("--quant-profile", dest="quant_profile", action="store_true",
                         help="time each quantized linear (A/B vs bf16) in-run, grouped by token count")
+    parser.add_argument("--attn-profile", dest="attn_profile", action="store_true",
+                        help="A/B time the attention backends (flash vs sage) in-run, by token count")
     parser.add_argument("--warmup", type=int, default=None,
                         help="untimed warmup generations before measuring "
                              "(default 3 when --benchmark/--quant-profile, else 0)")
@@ -210,7 +212,8 @@ def main():
     # Warm up before any measurement: the first calls pay Triton JIT, cuBLAS /
     # _scaled_mm algorithm selection and allocator growth, which would otherwise
     # pollute the timed/profiled run.
-    n_warmup = args.warmup if args.warmup is not None else (3 if (args.benchmark or args.quant_profile) else 0)
+    n_warmup = args.warmup if args.warmup is not None else (
+        3 if (args.benchmark or args.quant_profile or args.attn_profile) else 0)
     for i in range(n_warmup):
         log(f"[TP] warmup {i + 1}/{n_warmup} ...")
         set_seed(args.seed)
@@ -224,6 +227,10 @@ def main():
         from modeling import fp8_profile
         fp8_profile.enable(ab=True)
         log("[TP] fp8 profiling enabled (A/B vs bf16) -- doubles linear compute for the run")
+    if args.attn_profile:
+        from modeling import attn_profile
+        attn_profile.enable(ab=True)
+        log("[TP] attn profiling enabled (A/B flash vs sage) -- doubles attention compute for the run")
 
     # Identical seed on every rank -> identical replicated noise / sampling.
     set_seed(args.seed)
@@ -247,6 +254,10 @@ def main():
     if args.quant_profile and rank == 0:
         from modeling import fp8_profile
         fp8_profile.report()
+
+    if args.attn_profile and rank == 0:
+        from modeling import attn_profile
+        attn_profile.report()
 
     if rank == 0:
         image = output["image"]

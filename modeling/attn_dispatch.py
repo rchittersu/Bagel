@@ -21,6 +21,8 @@ import os
 
 from flash_attn import flash_attn_varlen_func
 
+from modeling import attn_profile
+
 # Resolved once at import; override at runtime with set_attn_backend().
 _BACKEND = os.environ.get("BAGEL_ATTN_BACKEND", "flash").lower()
 
@@ -81,6 +83,15 @@ def attn_varlen_func(
     Dispatches to Sage or FlashAttention per ``BAGEL_ATTN_BACKEND``. q/k/v packed
     ``[total_tokens, n_heads, head_dim]``; GQA allowed.
     """
+    if not attn_profile.is_enabled():
+        if _BACKEND == "sage":
+            return _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+        return _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+
+    # A/B: time both backends on the same inputs; return the active backend's result.
+    m = int(q.shape[0])  # total query tokens
+    flash_fn = lambda: _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+    sage_fn = lambda: _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
     if _BACKEND == "sage":
-        return _sage_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
-    return _flash_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+        return attn_profile.run(m, "sage", sage_fn, "flash", flash_fn)
+    return attn_profile.run(m, "flash", flash_fn, "sage", sage_fn)
