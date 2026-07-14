@@ -898,15 +898,53 @@ class Bagel(PreTrainedModel):
                 "packed_text_indexes": packed_text_indexes
             }
         
-        if self.language_model.model.enable_taylorseer:
-            self.language_model.model.cache_dic = model_pred_cache_dic
-            self.language_model.model.current = model_pred_current
+        # Each CFG branch is the same LLM forward with a different KV-side mapping /
+        # context. Run them via the shared helper (also used by the CFG-parallel path).
+        v_t = self._branch_llm_forward(
+            packed_sequence, packed_seqlens, packed_vae_token_indexes, extra_inputs,
+            packed_position_ids, packed_indexes, past_key_values,
+            key_values_lens, packed_key_value_indexes,
+            model_pred_cache_dic, model_pred_current,
+        )
+        cfg_text_v_t = None
+        if cfg_text_scale > 1.0:
+            cfg_text_v_t = self._branch_llm_forward(
+                packed_sequence, packed_seqlens, packed_vae_token_indexes, extra_inputs,
+                cfg_text_packed_position_ids, cfg_text_packed_query_indexes, cfg_text_past_key_values,
+                cfg_text_key_values_lens, cfg_text_packed_key_value_indexes,
+                model_pred_text_cache_dic, model_pred_text_current,
+            )
+        cfg_img_v_t = None
+        if cfg_img_scale > 1.0:
+            cfg_img_v_t = self._branch_llm_forward(
+                packed_sequence, packed_seqlens, packed_vae_token_indexes, extra_inputs,
+                cfg_img_packed_position_ids, cfg_img_packed_query_indexes, cfg_img_past_key_values,
+                cfg_img_key_values_lens, cfg_img_packed_key_value_indexes,
+                model_pred_img_cache_dic, model_pred_img_current,
+            )
+        return self._cfg_combine(
+            v_t, cfg_text_v_t, cfg_img_v_t,
+            cfg_text_scale, cfg_img_scale, cfg_renorm_type, cfg_renorm_min,
+        )
 
+    def _branch_llm_forward(self, packed_sequence, packed_seqlens, packed_vae_token_indexes,
+                            extra_inputs, packed_query_position_ids, packed_query_indexes,
+                            past_key_values, key_values_lens, packed_key_value_indexes,
+                            taylor_cache_dic=None, taylor_current=None):
+        """One CFG branch's LLM forward -> raw v_t at the vae positions.
+
+        Branches share the query (packed_sequence) and differ only in the KV-side mapping
+        (position ids, query/kv indexes, past_key_values, lens). Used by _forward_flow (all
+        branches on one process) and generate_image_cfg_parallel (one branch per rank).
+        """
+        if self.language_model.model.enable_taylorseer:
+            self.language_model.model.cache_dic = taylor_cache_dic
+            self.language_model.model.current = taylor_current
         output = self.language_model.forward_inference(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
-            packed_query_position_ids=packed_position_ids,
-            packed_query_indexes=packed_indexes,
+            packed_query_position_ids=packed_query_position_ids,
+            packed_query_indexes=packed_query_indexes,
             past_key_values=past_key_values,
             key_values_lens=key_values_lens,
             packed_key_value_indexes=packed_key_value_indexes,
@@ -915,46 +953,11 @@ class Bagel(PreTrainedModel):
             **extra_inputs,
         )
         v_t = self.llm2vae(output.packed_query_sequence)
-        v_t = v_t[packed_vae_token_indexes]
+        return v_t[packed_vae_token_indexes]
 
-        if cfg_text_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
-                self.language_model.model.cache_dic = model_pred_text_cache_dic
-                self.language_model.model.current = model_pred_text_current
-            cfg_text_output = self.language_model.forward_inference(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_text_packed_position_ids,
-                packed_query_indexes=cfg_text_packed_query_indexes,
-                past_key_values=cfg_text_past_key_values,
-                key_values_lens=cfg_text_key_values_lens,
-                packed_key_value_indexes=cfg_text_packed_key_value_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
-            )
-            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
-            cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
-
-        if cfg_img_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
-                self.language_model.model.cache_dic = model_pred_img_cache_dic
-                self.language_model.model.current = model_pred_img_current
-            cfg_img_output = self.language_model.forward_inference(
-                packed_query_sequence=packed_sequence,
-                query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_img_packed_position_ids,
-                packed_query_indexes=cfg_img_packed_query_indexes,
-                past_key_values=cfg_img_past_key_values,
-                key_values_lens=cfg_img_key_values_lens,
-                packed_key_value_indexes=cfg_img_packed_key_value_indexes,
-                update_past_key_values=False,
-                is_causal=False,
-                **extra_inputs,
-            )
-            cfg_img_v_t = self.llm2vae(cfg_img_output.packed_query_sequence)
-            cfg_img_v_t = cfg_img_v_t[packed_vae_token_indexes]
-
+    def _cfg_combine(self, v_t, cfg_text_v_t, cfg_img_v_t,
+                     cfg_text_scale, cfg_img_scale, cfg_renorm_type, cfg_renorm_min):
+        """Combine the per-branch v_t into the guided velocity (unchanged CFG math)."""
         if cfg_text_scale > 1.0:
             if cfg_renorm_type == "text_channel":
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
