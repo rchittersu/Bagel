@@ -200,7 +200,55 @@ class InterleaveInferencer:
         image = self.decode_image(unpacked_latent[0], image_shape)
         return image
 
-        
+    @torch.no_grad()
+    def gen_image_cfg_parallel(
+        self, branch, cfg_group, num_branches,
+        image=None, text=None, image_shape=None, decode=True,
+        think=False, system_prompt=None, use_vit=True,
+        cfg_text_scale=4.0, cfg_img_scale=2.0,
+        cfg_interval=(0.4, 1.0), cfg_renorm_min=0.0, cfg_renorm_type="text_channel",
+        num_timesteps=50, timestep_shift=3.0,
+    ):
+        """CFG-parallel image generation. This rank builds ONLY its branch's context
+        (rank-aware prefill), then all ranks run the CFG-parallel denoise (one branch each,
+        v_t all-gathered). branch: 0=main (image+text), 1=cfg_text (image only), 2=cfg_img
+        (text only); branch must equal the process rank. Only decode on rank 0 (decode=True).
+        """
+        # Rank-aware prefill: each branch drops the conditioning it guides against --
+        #   image (vae/vit) -> branches {main(0), cfg_text(1)}
+        #   text            -> branches {main(0), cfg_img(2)}
+        #   system (think)  -> all branches
+        gen_context = self.init_gen_context()
+        with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+            if think and system_prompt is not None:
+                gen_context = self.update_context_text(system_prompt, gen_context)
+            if image is not None:
+                image = self.vae_transform.resize_transform(pil_img2rgb(image))
+                image_shape = image.size[::-1]
+                if branch in (0, 1):
+                    gen_context = self.update_context_image(image, gen_context, vae=True, vit=use_vit)
+            if text is not None and branch in (0, 2):
+                gen_context = self.update_context_text(text, gen_context)
+
+            generation_input = self.model.prepare_vae_latent(
+                curr_kvlens=gen_context['kv_lens'],
+                curr_rope=gen_context['ropes'],
+                image_sizes=[image_shape],
+                new_token_ids=self.new_token_ids,
+            )
+            unpacked_latent = self.model.generate_image_cfg_parallel(
+                branch=branch, cfg_group=cfg_group, num_branches=num_branches,
+                past_key_values=gen_context['past_key_values'],
+                num_timesteps=num_timesteps, timestep_shift=timestep_shift,
+                cfg_text_scale=cfg_text_scale, cfg_img_scale=cfg_img_scale,
+                cfg_interval=cfg_interval, cfg_renorm_min=cfg_renorm_min,
+                cfg_renorm_type=cfg_renorm_type,
+                **generation_input,
+            )
+        if not decode:
+            return None
+        return self.decode_image(unpacked_latent[0], image_shape)
+
     def decode_image(self, latent, image_shape):
         H, W = image_shape
         h, w = H // self.model.latent_downsample, W // self.model.latent_downsample

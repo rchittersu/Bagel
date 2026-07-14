@@ -994,6 +994,118 @@ class Bagel(PreTrainedModel):
 
         return v_t
 
+    @torch.no_grad
+    def generate_image_cfg_parallel(
+        self,
+        branch: int,          # 0=main (cond), 1=cfg_text, 2=cfg_img -- must equal this rank
+        cfg_group,            # torch.distributed group of the branch ranks
+        num_branches: int,    # 2 or 3
+        # This rank's branch inputs (from prepare_vae_latent on its OWN context). The
+        # query parts (text_ids/indexes, noises, vae positions, seqlens) match across ranks
+        # given the same seed; the KV parts (position_ids, indexes, past_key_values, lens)
+        # are this branch's own.
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        packed_init_noises: torch.Tensor,
+        packed_vae_position_ids: torch.LongTensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_seqlens: torch.IntTensor,
+        packed_position_ids: torch.LongTensor,
+        packed_indexes: torch.LongTensor,
+        past_key_values: NaiveCache,
+        key_values_lens: torch.IntTensor,
+        packed_key_value_indexes: torch.LongTensor,
+        # Global CFG config -- identical on every rank so the combine is consistent.
+        num_timesteps: int = 50,
+        timestep_shift: float = 3.0,
+        cfg_text_scale: float = 1.0,
+        cfg_img_scale: float = 1.0,
+        cfg_interval: Optional[Tuple[float, float]] = (0.4, 1.0),
+        cfg_renorm_min: float = 0.0,
+        cfg_renorm_type: str = "global",
+    ):
+        """CFG-parallel denoise: each rank runs ONE branch's forward; the per-step v_t are
+        all-gathered and every rank runs the identical CFG combine, so x_t stays in sync.
+        The only communication is one all_gather of v_t per step (vs TP's 2 all-reduces per
+        layer). taylorseer is assumed off. rank r must run branch r (gather order = rank).
+        """
+        device = self.device
+        self.language_model.model.enable_taylorseer = False
+
+        def _dev(t):
+            return t.to(device) if isinstance(t, torch.Tensor) else t
+        packed_text_ids = _dev(packed_text_ids)
+        packed_text_indexes = _dev(packed_text_indexes)
+        packed_init_noises = _dev(packed_init_noises)
+        packed_vae_position_ids = _dev(packed_vae_position_ids)
+        packed_vae_token_indexes = _dev(packed_vae_token_indexes)
+        packed_seqlens = _dev(packed_seqlens)
+        packed_position_ids = _dev(packed_position_ids)
+        packed_indexes = _dev(packed_indexes)
+        key_values_lens = _dev(key_values_lens)
+        packed_key_value_indexes = _dev(packed_key_value_indexes)
+
+        x_t = packed_init_noises
+        if num_branches > 1:
+            # The initial latent noise MUST be identical on every branch rank (they denoise
+            # the same latent). Broadcast from branch 0 to defend against any RNG drift in
+            # the (branch-specific) prefill.
+            torch.distributed.broadcast(x_t, src=0, group=cfg_group)
+
+        # Loop-invariant (same on every rank): text embedding + its scatter, latent pos-embed.
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence_base = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence_base[packed_text_indexes] = packed_text_embedding
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {
+                "mode": "gen",
+                "packed_vae_token_indexes": packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes,
+            }
+
+        timesteps = torch.linspace(1, 0, num_timesteps, device=device)
+        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
+        dts = timesteps[:-1] - timesteps[1:]
+        timesteps = timesteps[:-1]
+
+        for i, t in tqdm(enumerate(timesteps), total=len(timesteps), disable=(branch != 0)):
+            timestep = torch.tensor([t] * x_t.shape[0], device=device)
+            if t > cfg_interval[0] and t <= cfg_interval[1]:
+                cfg_text_scale_, cfg_img_scale_ = cfg_text_scale, cfg_img_scale
+            else:
+                cfg_text_scale_, cfg_img_scale_ = 1.0, 1.0
+
+            # This rank's branch forward (query identical across ranks; KV/context is ours).
+            packed_sequence = packed_sequence_base.clone()
+            x_emb = self.vae2llm(x_t) + self.time_embedder(timestep) + packed_pos_embed
+            if x_emb.dtype != packed_sequence.dtype:
+                x_emb = x_emb.to(packed_sequence.dtype)
+            packed_sequence[packed_vae_token_indexes] = x_emb
+
+            v_local = self._branch_llm_forward(
+                packed_sequence, packed_seqlens, packed_vae_token_indexes, extra_inputs,
+                packed_position_ids, packed_indexes, past_key_values,
+                key_values_lens, packed_key_value_indexes,
+            ).contiguous()
+
+            # Sync point: gather every branch's v_t, then combine identically on all ranks.
+            gathered = [torch.empty_like(v_local) for _ in range(num_branches)]
+            torch.distributed.all_gather(gathered, v_local, group=cfg_group)
+
+            v_t = self._cfg_combine(
+                gathered[0],
+                gathered[1] if num_branches > 1 else None,
+                gathered[2] if num_branches > 2 else None,
+                cfg_text_scale_, cfg_img_scale_, cfg_renorm_type, cfg_renorm_min,
+            )
+            x_t = x_t - v_t * dts[i]
+
+        unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+        return unpacked_latent
+
     def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
         packed_start_tokens, packed_key_value_indexes = list(), list()
         packed_query_position_ids = list()
