@@ -365,8 +365,8 @@ class PackedAttention(Qwen2Attention):
             merged_value_states,
             cu_seqlens_q=cu_seqlens_q.to(torch.int32),
             cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-            max_seqlen_q=max(query_lens).item(),
-            max_seqlen_k=max(key_values_lens).item(),
+            max_seqlen_q=query_lens.amax().item(),
+            max_seqlen_k=key_values_lens.amax().item(),
             causal=is_causal,
         )
         packed_attn_output = packed_attn_output.reshape(-1, self.attn_inner_dim)
@@ -592,8 +592,8 @@ class PackedAttentionMoT(Qwen2Attention):
             merged_value_states,
             cu_seqlens_q=cu_seqlens_q.to(torch.int32),
             cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-            max_seqlen_q=max(query_lens).item(),
-            max_seqlen_k=max(key_values_lens).item(),
+            max_seqlen_q=query_lens.amax().item(),
+            max_seqlen_k=key_values_lens.amax().item(),
             causal=is_causal,
         )
         packed_attn_output = packed_attn_output.reshape(-1, self.attn_inner_dim)

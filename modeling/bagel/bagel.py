@@ -5,9 +5,15 @@ import copy
 from typing import List, Tuple, Optional, Dict, Any
 
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
+
+# flash-attn needs max_seqlen as a Python int, computed via .item() inside the attention.
+# Under torch.compile that .item() would graph-break; capturing scalar outputs lets it
+# flow as a symint (materialized at the flash-attn boundary) instead. Harmless in eager.
+torch._dynamo.config.capture_scalar_outputs = True
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
