@@ -760,6 +760,16 @@ class Bagel(PreTrainedModel):
     
         x_t = packed_init_noises
 
+        # Loop-invariant: the text embedding + its scatter and the latent position
+        # embedding don't change across denoise steps (only x_t at the vae positions
+        # does). Compute them once here instead of every step -- this also keeps the
+        # per-step _forward_flow graph small for torch.compile. packed_sequence_base has
+        # the text tokens filled and zeros at the vae positions.
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence_base = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+        packed_sequence_base[packed_text_indexes] = packed_text_embedding
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts =  timesteps[:-1] - timesteps[1:]
@@ -778,9 +788,9 @@ class Bagel(PreTrainedModel):
                 x_t=x_t,
                 timestep=timestep, 
                 packed_vae_token_indexes=packed_vae_token_indexes,
-                packed_vae_position_ids=packed_vae_position_ids,
-                packed_text_ids=packed_text_ids,
                 packed_text_indexes=packed_text_indexes,
+                packed_sequence_base=packed_sequence_base,
+                packed_pos_embed=packed_pos_embed,
                 packed_position_ids=packed_position_ids,
                 packed_indexes=packed_indexes,
                 packed_seqlens=packed_seqlens,
@@ -829,9 +839,9 @@ class Bagel(PreTrainedModel):
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
         packed_vae_token_indexes: torch.LongTensor,
-        packed_vae_position_ids: torch.LongTensor,
-        packed_text_ids: torch.LongTensor,
         packed_text_indexes: torch.LongTensor,
+        packed_sequence_base: torch.Tensor,
+        packed_pos_embed: torch.Tensor,
         packed_indexes: torch.LongTensor,
         packed_position_ids: torch.LongTensor,
         packed_seqlens: torch.IntTensor,
@@ -863,12 +873,11 @@ class Bagel(PreTrainedModel):
         model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
         model_pred_img_current: Optional[int] = None,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-
-        assert timestep.unique().shape[0] == 1
-        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        # Text tokens + latent pos-embed are precomputed in generate_image (invariant).
+        # Clone the base (compile-friendly: no mutation of an external buffer) and write
+        # only this step's latent embedding into the vae positions. The old host-sync
+        # assert (timestep.unique()) is dropped -- timestep is uniform by construction.
+        packed_sequence = packed_sequence_base.clone()
         packed_timestep_embeds = self.time_embedder(timestep)
         x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
         if x_t.dtype != packed_sequence.dtype:
