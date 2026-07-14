@@ -386,9 +386,13 @@ def dequant_int32(acc, act_scale, w_scale):
 
 
 # Scheme routers used by the linears / MLP so a single call site serves fp8 and int8.
+# Marked torch.compiler.disable: these launch raw Triton kernels Dynamo can't trace, so
+# they run eager (opaque) and the surrounding transformer still compiles.
+@torch.compiler.disable
 def quant_only(x, scheme):
     return quant_int8_only(x) if scheme == "int8" else quant_fp8_only(x)
 
 
+@torch.compiler.disable
 def silumul_quant(gate, up, scheme):
     return silumul_int8_quant(gate, up) if scheme == "int8" else silumul_fp8_quant(gate, up)

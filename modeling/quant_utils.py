@@ -202,6 +202,7 @@ def int8_mm_dequant(
     return out
 
 
+@torch.compiler.disable
 def mm_dequant(
     x_q: torch.Tensor,
     act_scale: torch.Tensor,
@@ -210,12 +211,18 @@ def mm_dequant(
     scheme: str,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Scheme-aware low-level GEMM on pre-quantized 2-D operands -> bf16 ``[M, N]``."""
+    """Scheme-aware low-level GEMM on pre-quantized 2-D operands -> bf16 ``[M, N]``.
+
+    Marked ``torch.compiler.disable``: the fp8/int8 GEMM + fused Triton dequant are
+    hand-optimized and call raw Triton kernels that Dynamo can't trace. Running this
+    eager (opaque to compile) lets the surrounding transformer still compile.
+    """
     if scheme == "int8":
         return int8_mm_dequant(x_q, act_scale, w_q, w_scale, bias)
     return scaled_mm_fp8(x_q, act_scale, w_q, w_scale, bias)
 
 
+@torch.compiler.disable
 def quant_w8a8_linear(
     x: torch.Tensor,
     w_q: torch.Tensor,
@@ -225,6 +232,9 @@ def quant_w8a8_linear(
     fallback_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """W8A8 matmul (fp8 via ``_scaled_mm`` or int8 via ``_int_mm`` + fused dequant).
+
+    Marked ``torch.compiler.disable`` (raw Triton quant kernels + lazy imports can't be
+    traced): runs eager so the surrounding transformer can still be compiled.
 
     ``x`` may be N-D; only the last dim (``K``) is contracted. Quantizes ``x`` per-token
     via the fused Triton prologue. When preconditions aren't met (small ``M`` / odd ``K``)
